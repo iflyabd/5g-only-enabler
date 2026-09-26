@@ -3,31 +3,53 @@ package dev.iflyabd.netmodeenabler
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.Bundle
 import android.telephony.SubscriptionManager
-import androidx.preference.ListPreference
-import androidx.preference.Preference
-import androidx.preference.PreferenceGroup
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
 
 /**
  * Settings-side hooks (com.android.settings + com.oplus.wirelesssettings).
+ *
+ * NOTE: androidx.preference classes must NEVER be referenced directly here
+ * (no imports, no casts, no `Foo::class.java`). The module APK's classloader
+ * cannot see them and every direct reference dies with NoClassDefFoundError.
+ * Everything below goes through the target process classloader + reflection.
  *
  * Strategy (works without knowing OnePlus's exact controller class names):
  * 1. Extend every Preferred-Network-Type-looking ListPreference with the 4 extra
  *    entries (values 27/11/2/29). Re-applied on every setEntries/setEntryValues
  *    and on every fragment start, so stock refreshes can't wipe it.
- * 2. Wrap the ListPreference's change listener: our 4 values are applied straight
- *    to the modem via TelephonyManager (subId resolved from the hosting fragment);
- *    every other value delegates to the stock controller untouched.
+ * 2. Wrap the ListPreference's change listener (dynamic Proxy): our 4 values are
+ *    applied straight to the modem via TelephonyManager (subId resolved from the
+ *    hosting fragment); every other value delegates to the stock controller.
  * 3. Widen TelephonyManager.getAllowedNetworkTypesForReason so stock filtering
  *    keeps its own entries, and un-hide carrier-config-gated network-mode UI.
  */
 object NetModeSettingsHook {
 
     private const val TAG = "NetModeEnabler"
+    private const val LIST_PREF = "androidx.preference.ListPreference"
+    private const val PREF = "androidx.preference.Preference"
+    private const val PREF_GROUP = "androidx.preference.PreferenceGroup"
+    private const val LISTENER = "androidx.preference.Preference\$OnPreferenceChangeListener"
+
+    private fun listPrefClass(cl: ClassLoader): Class<*> =
+        XposedHelpers.findClass(LIST_PREF, cl)
+
+    private fun isListPref(obj: Any?, cl: ClassLoader): Boolean {
+        if (obj == null) return false
+        return try {
+            listPrefClass(cl).isInstance(obj)
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
         hookListPreference(lpparam)
@@ -57,12 +79,46 @@ object NetModeSettingsHook {
             text.contains("2g") || text.contains("3g")
     }
 
-    private fun extendListPreference(lp: ListPreference) {
+    @Suppress("UNCHECKED_CAST")
+    private fun entriesOf(lp: Any): Array<out CharSequence>? {
+        return try {
+            XposedHelpers.callMethod(lp, "getEntries") as? Array<out CharSequence>
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun valuesOf(lp: Any): Array<out CharSequence>? {
+        return try {
+            XposedHelpers.callMethod(lp, "getEntryValues") as? Array<out CharSequence>
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun keyOf(lp: Any): String {
+        return try {
+            XposedHelpers.callMethod(lp, "getKey") as? String ?: "?"
+        } catch (_: Throwable) {
+            "?"
+        }
+    }
+
+    private fun contextOf(lp: Any): Context? {
+        return try {
+            XposedHelpers.callMethod(lp, "getContext") as? Context
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun extendListPreference(lp: Any, cl: ClassLoader) {
         try {
-            val entries = lp.entries
-            val values = lp.entryValues
-            if (!isNetworkModeList(entries, values)) return
-            val cur = values.map { it.toString() }.toMutableList()
+            if (!isListPref(lp, cl)) return
+            val values = valuesOf(lp)
+            if (!isNetworkModeList(entriesOf(lp), values)) return
+            val cur = values!!.map { it.toString() }.toMutableList()
             var added = false
             for (m in NetModes.EXTRA_MODES) {
                 if (!cur.contains(m.networkMode.toString())) {
@@ -71,24 +127,24 @@ object NetModeSettingsHook {
                 }
             }
             if (!added) return
-            val oldEntries = entries?.map { it.toString() } ?: emptyList()
+            val oldEntries = entriesOf(lp)?.map { it.toString() } ?: emptyList()
             val allEntries: List<CharSequence> = oldEntries + NetModes.EXTRA_MODES.map { it.label }
-            val newEntries: Array<CharSequence> = allEntries.toTypedArray()
             val allValues: List<CharSequence> = cur
-            val newValues: Array<CharSequence> = allValues.toTypedArray()
-            lp.entries = newEntries
-            lp.entryValues = newValues
-            XposedBridge.log("$TAG: extended '${lp.key}' entries=${newEntries.toList()} values=${newValues.toList()}")
+            XposedHelpers.callMethod(lp, "setEntries", allEntries.toTypedArray())
+            XposedHelpers.callMethod(lp, "setEntryValues", allValues.toTypedArray())
+            XposedBridge.log("$TAG: extended '${keyOf(lp)}' values=${cur}")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: extend failed: $e")
         }
     }
 
     private fun hookListPreference(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
         val after = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
-                    (param.thisObject as? ListPreference)?.let { extendListPreference(it) }
+                    extendListPreference(param.thisObject, cl)
+                    ensureWrapped(param.thisObject, cl, Int.MIN_VALUE)
                 } catch (_: Throwable) {
                 }
             }
@@ -96,8 +152,8 @@ object NetModeSettingsHook {
         for (m in listOf("setEntries", "setEntryValues")) {
             try {
                 XposedHelpers.findAndHookMethod(
-                    "androidx.preference.ListPreference",
-                    lpparam.classLoader,
+                    LIST_PREF,
+                    cl,
                     m,
                     Array<CharSequence>::class.java,
                     after,
@@ -112,10 +168,11 @@ object NetModeSettingsHook {
     // ---------- 2. fragment scan + listener wrapping ----------
 
     private fun hookFragments(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
         val scan = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
-                    scanFragment(param.thisObject)
+                    scanFragment(param.thisObject, cl)
                 } catch (e: Throwable) {
                     XposedBridge.log("$TAG: fragment scan failed: $e")
                 }
@@ -126,7 +183,7 @@ object NetModeSettingsHook {
             "com.android.settings.dashboard.DashboardFragment",
         )) {
             try {
-                XposedHelpers.findAndHookMethod(cls, lpparam.classLoader, "onStart", scan)
+                XposedHelpers.findAndHookMethod(cls, cl, "onStart", scan)
                 XposedBridge.log("$TAG: hooked $cls.onStart")
             } catch (e: Throwable) {
                 XposedBridge.log("$TAG: $cls hook failed: $e")
@@ -134,80 +191,126 @@ object NetModeSettingsHook {
         }
     }
 
-    private fun scanFragment(fragment: Any) {
+    private fun scanFragment(fragment: Any, cl: ClassLoader) {
         val screen = try {
-            XposedHelpers.callMethod(fragment, "getPreferenceScreen") as? PreferenceGroup ?: return
+            XposedHelpers.callMethod(fragment, "getPreferenceScreen") ?: return
         } catch (_: Throwable) {
             return
         }
         val subId = resolveSubId(fragment)
-        walkGroup(screen, subId)
+        walkGroup(screen, cl, subId)
     }
 
-    private fun walkGroup(group: PreferenceGroup, subId: Int) {
-        for (i in 0 until group.preferenceCount) {
+    private fun walkGroup(group: Any, cl: ClassLoader, subId: Int) {
+        val count = try {
+            XposedHelpers.callMethod(group, "getPreferenceCount") as? Int ?: return
+        } catch (_: Throwable) {
+            return
+        }
+        val groupClass = try {
+            XposedHelpers.findClass(PREF_GROUP, cl)
+        } catch (_: Throwable) {
+            null
+        }
+        for (i in 0 until count) {
             val p = try {
-                group.getPreference(i)
+                XposedHelpers.callMethod(group, "getPreference", i)
             } catch (_: Throwable) {
                 continue
-            }
-            when (p) {
-                is PreferenceGroup -> walkGroup(p, subId)
-                is ListPreference -> {
-                    extendListPreference(p)
-                    ensureWrapped(p, subId)
-                }
+            } ?: continue
+            if (groupClass != null && groupClass.isInstance(p)) {
+                walkGroup(p, cl, subId)
+            } else if (isListPref(p, cl)) {
+                extendListPreference(p, cl)
+                ensureWrapped(p, cl, subId)
             }
         }
     }
 
-    private fun ensureWrapped(lp: ListPreference, scanSubId: Int) {
+    private fun ensureWrapped(lp: Any, cl: ClassLoader, scanSubId: Int) {
         try {
-            if (!isNetworkModeList(lp.entries, lp.entryValues)) return
+            if (!isListPref(lp, cl)) return
+            if (!isNetworkModeList(entriesOf(lp), valuesOf(lp))) return
             if (XposedHelpers.getAdditionalInstanceField(lp, "netmode_wrapped") != null) return
+            val listenerIface = try {
+                XposedHelpers.findClass(LISTENER, cl)
+            } catch (e: Throwable) {
+                XposedBridge.log("$TAG: listener iface missing: $e")
+                return
+            }
             val orig = try {
-                lp.onPreferenceChangeListener
+                XposedHelpers.callMethod(lp, "getOnPreferenceChangeListener")
             } catch (_: Throwable) {
                 null
             }
-            // Don't wrap twice around ourselves.
-            if (orig != null && orig.javaClass.name.contains("NetModeWrapper")) return
-            lp.onPreferenceChangeListener = NetModeWrapper(orig, scanSubId)
+            if (orig != null && Proxy.isProxyClass(orig.javaClass)) {
+                XposedHelpers.setAdditionalInstanceField(lp, "netmode_wrapped", true)
+                return
+            }
+            val handler = NetModeListenerHandler(orig, scanSubId, cl)
+            val proxy = Proxy.newProxyInstance(cl, arrayOf(listenerIface), handler)
+            XposedHelpers.callMethod(lp, "setOnPreferenceChangeListener", proxy)
             XposedHelpers.setAdditionalInstanceField(lp, "netmode_wrapped", true)
-            XposedBridge.log("$TAG: wrapped listener for '${lp.key}' scanSubId=$scanSubId")
+            XposedBridge.log("$TAG: wrapped listener for '${keyOf(lp)}' scanSubId=$scanSubId")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: wrap failed: $e")
         }
     }
 
-    private class NetModeWrapper(
-        private val orig: Preference.OnPreferenceChangeListener?,
+    private class NetModeListenerHandler(
+        private val orig: Any?,
         private val scanSubId: Int,
-    ) : Preference.OnPreferenceChangeListener {
-        override fun onPreferenceChange(preference: Preference, newValue: Any?): Boolean {
-            try {
-                if (NetModes.isExtra(newValue)) {
-                    val lp = preference as? ListPreference ?: return false
-                    val mode = newValue.toString().toInt()
-                    val subId = if (scanSubId != Int.MIN_VALUE) scanSubId else fallbackSubId(lp.context)
-                    XposedBridge.log("$TAG: user picked ${NetModes.labelFor(mode)} ($mode) sub=$subId")
-                    val ok = NetModes.applyMode(lp.context, subId, mode)
-                    if (ok) {
-                        lp.value = mode.toString()
-                        lp.summary = NetModes.labelFor(mode)
+        private val cl: ClassLoader,
+    ) : InvocationHandler {
+        override fun invoke(proxy: Any, method: Method, args: Array<out Any>?): Any? {
+            if (method.name == "onPreferenceChange" && args != null && args.size == 2) {
+                val preference = args[0]
+                val newValue = args[1]
+                try {
+                    if (NetModes.isExtra(newValue)) {
+                        val mode = newValue.toString().toInt()
+                        val ctx = try {
+                            XposedHelpers.callMethod(preference, "getContext") as? Context
+                        } catch (_: Throwable) {
+                            null
+                        } ?: return false
+                        val subId = if (scanSubId != Int.MIN_VALUE) scanSubId else fallbackSubId(ctx)
+                        XposedBridge.log("$TAG: user picked ${NetModes.labelFor(mode)} ($mode) sub=$subId")
+                        val ok = NetModes.applyMode(ctx, subId, mode)
+                        if (ok) {
+                            try {
+                                XposedHelpers.callMethod(preference, "setValue", mode.toString())
+                                XposedHelpers.callMethod(preference, "setSummary", NetModes.labelFor(mode))
+                            } catch (_: Throwable) {
+                            }
+                        }
+                        return ok
                     }
-                    return ok
+                } catch (e: Throwable) {
+                    XposedBridge.log("$TAG: wrapper failed: $e")
+                    return false
                 }
-            } catch (e: Throwable) {
-                XposedBridge.log("$TAG: wrapper failed: $e")
-                return false
+                return try {
+                    if (orig != null) {
+                        (method.invoke(orig, preference, newValue) as? Boolean) ?: true
+                    } else {
+                        true
+                    }
+                } catch (e: Throwable) {
+                    XposedBridge.log("$TAG: stock listener failed: $e")
+                    false
+                }
             }
-            return try {
-                orig?.onPreferenceChange(preference, newValue) ?: true
-            } catch (e: Throwable) {
-                XposedBridge.log("$TAG: stock listener failed: $e")
-                false
+            if (method.name == "toString" && (args == null || args.isEmpty())) {
+                return "NetModeListenerHandler(orig=$orig)"
             }
+            if (method.name == "hashCode" && (args == null || args.isEmpty())) {
+                return System.identityHashCode(proxy)
+            }
+            if (method.name == "equals" && args != null && args.size == 1) {
+                return proxy === args[0]
+            }
+            return null
         }
     }
 
@@ -216,7 +319,7 @@ object NetModeSettingsHook {
     private fun resolveSubId(fragment: Any): Int {
         // 1. Fragment arguments (AOSP uses Settings.EXTRA_SUB_ID = "sub_id").
         try {
-            val args = XposedHelpers.callMethod(fragment, "getArguments") as? android.os.Bundle
+            val args = XposedHelpers.callMethod(fragment, "getArguments") as? Bundle
             if (args != null) {
                 for (k in listOf("sub_id", "subscription_id", "subId", "subId_extra", "slot_id", "slot")) {
                     if (args.containsKey(k)) {
@@ -286,6 +389,13 @@ object NetModeSettingsHook {
     // ---------- 3. direct AOSP controller hooks (exact mSubId) ----------
 
     private fun hookControllers(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
+        val prefClass = try {
+            XposedHelpers.findClass(PREF, cl)
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: Preference class missing, skipping controller hooks: $e")
+            return
+        }
         val candidates = listOf(
             "com.android.settings.network.telephony.EnabledNetworkModePreferenceController",
         )
@@ -293,8 +403,8 @@ object NetModeSettingsHook {
             // Intercept our values before stock logic rejects them.
             try {
                 XposedHelpers.findAndHookMethod(
-                    cls, lpparam.classLoader, "onPreferenceChange",
-                    Preference::class.java, Object::class.java,
+                    cls, cl, "onPreferenceChange",
+                    prefClass, Object::class.java,
                     object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             try {
@@ -319,9 +429,13 @@ object NetModeSettingsHook {
                                 XposedBridge.log("$TAG: controller intercept mode=$mode sub=$sid")
                                 val ok = NetModes.applyMode(ctx, sid, mode)
                                 if (ok) {
-                                    (param.args.getOrNull(0) as? ListPreference)?.let { lp ->
-                                        lp.value = mode.toString()
-                                        lp.summary = NetModes.labelFor(mode)
+                                    try {
+                                        val lp = param.args.getOrNull(0)
+                                        if (lp != null && isListPref(lp, cl)) {
+                                            XposedHelpers.callMethod(lp, "setValue", mode.toString())
+                                            XposedHelpers.callMethod(lp, "setSummary", NetModes.labelFor(mode))
+                                        }
+                                    } catch (_: Throwable) {
                                     }
                                 }
                                 param.result = ok
@@ -333,10 +447,8 @@ object NetModeSettingsHook {
                 )
                 XposedBridge.log("$TAG: hooked $cls.onPreferenceChange")
             } catch (e: Throwable) {
-                XposedBridge.log("$TAG: $cls hook failed (OPlus ROMs use the generic wrapper instead): $e")
+                XposedBridge.log("$TAG: $cls hook skipped (generic wrapper covers it): $e")
             }
-            // After stock refreshes the list, our setEntries hook re-extends it.
-            // Nothing else needed here.
         }
     }
 
