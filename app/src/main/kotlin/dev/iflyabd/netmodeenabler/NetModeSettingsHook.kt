@@ -54,10 +54,118 @@ object NetModeSettingsHook {
     fun init(lpparam: XC_LoadPackage.LoadPackageParam) {
         hookListPreference(lpparam)
         hookFragments(lpparam)
+        hookDiscovery(lpparam)
         hookControllers(lpparam)
         hookAllowedTypes(lpparam)
         NetModeFrameworkHook.hookCarrierUnhide(lpparam)
         XposedBridge.log("$TAG: settings hooks installed in ${lpparam.packageName}")
+    }
+
+    // ---------- 0. discovery: find what really builds the OPlus screen ----------
+
+    private val WATCH = listOf(
+        "network", "mobile", "sim", "telephon", "carrier", "radio",
+        "prefer", "apn", "data", "wireless",
+    )
+
+    private fun hookDiscovery(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
+        try {
+            XposedHelpers.findAndHookMethod(
+                "androidx.fragment.app.Fragment",
+                cl,
+                "onResume",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            discover(param.thisObject, cl)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: discovery hook installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: discovery hook failed: $e")
+        }
+    }
+
+    private fun discover(fragment: Any, cl: ClassLoader) {
+        val name = fragment.javaClass.name
+        val lower = name.lowercase()
+        // Always log wirelesssettings screens (small app); elsewhere only watched ones.
+        val pkg = try {
+            fragment.javaClass.`package`?.name ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+        val interesting = WATCH.any { lower.contains(it) } ||
+            pkg.contains("wirelesssettings") ||
+            pkg.contains("settings.network") ||
+            pkg.contains("settings.sim")
+        if (!interesting) return
+        XposedBridge.log("$TAG: screen fragment=$name")
+        try {
+            val args = XposedHelpers.callMethod(fragment, "getArguments") as? Bundle
+            if (args != null) {
+                XposedBridge.log("$TAG:   args=${args.keySet().joinToString { k -> "$k=${args.get(k)}" }}")
+            }
+        } catch (_: Throwable) {
+        }
+        val screen = try {
+            XposedHelpers.callMethod(fragment, "getPreferenceScreen")
+        } catch (_: Throwable) {
+            null
+        }
+        if (screen == null) {
+            XposedBridge.log("$TAG:   no PreferenceScreen (fully custom UI)")
+            return
+        }
+        dumpGroup(screen, cl, "  ")
+    }
+
+    private fun dumpGroup(group: Any, cl: ClassLoader, indent: String) {
+        val count = try {
+            XposedHelpers.callMethod(group, "getPreferenceCount") as? Int ?: return
+        } catch (_: Throwable) {
+            return
+        }
+        val groupClass = try {
+            XposedHelpers.findClass(PREF_GROUP, cl)
+        } catch (_: Throwable) {
+            null
+        }
+        for (i in 0 until count) {
+            val p = try {
+                XposedHelpers.callMethod(group, "getPreference", i)
+            } catch (_: Throwable) {
+                continue
+            } ?: continue
+            val cls = p.javaClass.name
+            val key = try {
+                XposedHelpers.callMethod(p, "getKey") as? String
+            } catch (_: Throwable) {
+                null
+            }
+            val title = try {
+                (XposedHelpers.callMethod(p, "getTitle") as? CharSequence)?.toString()
+            } catch (_: Throwable) {
+                null
+            }
+            XposedBridge.log("$TAG: $indent$cls key=$key title=$title")
+            // List-like prefs: dump entries/values whatever the class is.
+            try {
+                val e = XposedHelpers.callMethod(p, "getEntries") as? Array<*>
+                val v = XposedHelpers.callMethod(p, "getEntryValues") as? Array<*>
+                if (e != null || v != null) {
+                    XposedBridge.log("$TAG: $indent  entries=${e?.map { it.toString() }} values=${v?.map { it.toString() }}")
+                }
+            } catch (_: Throwable) {
+            }
+            if (groupClass != null && groupClass.isInstance(p)) {
+                dumpGroup(p, cl, "$indent  ")
+            }
+        }
     }
 
     // ---------- 1. ListPreference extension ----------
