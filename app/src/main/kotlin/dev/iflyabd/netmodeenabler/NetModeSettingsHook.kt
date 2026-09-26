@@ -277,8 +277,7 @@ object NetModeSettingsHook {
             }
         }
         return try {
-            val base = activity ?: context.applicationContext ?: context
-            SubscriptionManager.from(base).defaultDataSubscriptionId
+            SubscriptionManager.getDefaultDataSubscriptionId()
         } catch (_: Throwable) {
             Int.MIN_VALUE
         }
