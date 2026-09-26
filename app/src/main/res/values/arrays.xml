@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposed_scope">
+        <item>com.android.settings</item>
+        <item>com.oplus.wirelesssettings</item>
+        <item>com.android.phone</item>
+        <item>android</item>
+    </string-array>
+</resources>

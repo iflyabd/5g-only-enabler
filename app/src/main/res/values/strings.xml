@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">5G Only Enabler</string>
+    <string name="module_description">Adds 5G Only, 4G Only, 3G Only and 5G/4G Only to Settings &gt; Mobile Networks &gt; Preferred Network Type (per SIM)</string>
+</resources>
