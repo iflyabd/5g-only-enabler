@@ -191,11 +191,11 @@ object OplusPreferredNetworkHook {
         try {
             f.isAccessible = true
             @Suppress("UNCHECKED_CAST")
-            val list = f.get(obj) as? MutableList<Any?> ?: return
+            val list = f.get(obj) as? List<*> ?: return
             val fname = f.name.lowercase()
             val looksLabels = fname.contains("label") || fname.contains("title") ||
                 fname.contains("entr") || fname.contains("text") || fname.contains("name") ||
-                fname.contains("string") || fname.contains("item")
+                fname.contains("string") || fname.contains("item") || fname.contains("object")
             val looksValues = fname.contains("value") || fname.contains("mode") ||
                 fname.contains("type") || fname.contains("id") || fname.contains("int")
             val first = list.firstOrNull()
@@ -208,13 +208,11 @@ object OplusPreferredNetworkHook {
                 list.isEmpty() && looksValues -> false
                 else -> return // unknown list (probably custom items) — leave, dump covers it
             }
-            list.clear()
-            if (useLabels) {
-                list.addAll(labels.toList())
-            } else {
-                list.addAll(values.toList())
-            }
-            XposedBridge.log("$TAG: set ${obj.javaClass.simpleName}.${f.name} = ${if (useLabels) "labels" else "values"}[${list.size}]")
+            // REPLACE the reference: ArrayAdapter wraps arrays with fixed-size
+            // Arrays.asList, whose clear()/add() throw. A fresh ArrayList works.
+            val newData = java.util.ArrayList<Any?>(if (useLabels) labels.toList() else values.toList())
+            f.set(obj, newData)
+            XposedBridge.log("$TAG: set ${obj.javaClass.simpleName}.${f.name} = ${if (useLabels) "labels" else "values"}[${newData.size}] (replaced)")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: mutate list ${f.name} failed: $e")
         }
