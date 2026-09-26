@@ -103,7 +103,9 @@ object NetModeSettingsHook {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
                             val act = param.thisObject as? Activity ?: return
-                            XposedBridge.log("$TAG: activity-resume [$pkg] ${act.javaClass.name}")
+                            val name = act.javaClass.name
+                            XposedBridge.log("$TAG: activity-resume [$pkg] $name")
+                            dumpWatchedActivity(act)
                         } catch (_: Throwable) {
                         }
                     }
@@ -115,8 +117,7 @@ object NetModeSettingsHook {
         }
     }
 
-    private fun discover(fragment: Any, cl: ClassLoader) {
-        val name = fragment.javaClass.name
+    private fun discover(fragment: Any, cl: ClassLoader) {        val name = fragment.javaClass.name
         val lower = name.lowercase()
         // Details only for watched screens; the class line itself is always logged.
         val interesting = WATCH.any { lower.contains(it) } ||
@@ -183,6 +184,67 @@ object NetModeSettingsHook {
             }
             if (groupClass != null && groupClass.isInstance(p)) {
                 dumpGroup(p, cl, "$indent  ")
+            }
+        }
+    }
+
+    // ---------- 0b. watched Activity dump (OPlus phone-process screens) ----------
+
+    private fun isWatchedActivity(name: String): Boolean {
+        val lower = name.lowercase()
+        return WATCH.any { lower.contains(it) } ||
+            lower.contains("choosenetwork") || lower.contains("networkselect") ||
+            lower.contains("mobilenetwork") || lower.contains("preferred") ||
+            lower.contains("exportpreferred") || lower.contains("siminfo") ||
+            lower.contains("simsettings")
+    }
+
+    private fun dumpWatchedActivity(activity: Activity) {
+        if (!isWatchedActivity(activity.javaClass.name)) return
+        XposedBridge.log("$TAG: watched activity=${activity.javaClass.name}")
+        try {
+            val ex = activity.intent?.extras
+            if (ex != null) {
+                XposedBridge.log("$TAG:   extras=${ex.keySet().joinToString { k -> "$k=${ex.get(k)}" }}")
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            val root = activity.findViewById<android.view.View>(android.R.id.content)
+            if (root == null) {
+                XposedBridge.log("$TAG:   no content view")
+                return
+            }
+            dumpCounter = 0
+            dumpView(root, "  ", 0)
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG:   view dump failed: $e")
+        }
+    }
+
+    private var dumpCounter = 0
+
+    private fun dumpView(v: android.view.View, indent: String, depth: Int) {
+        if (depth > 12 || dumpCounter > 400) return
+        dumpCounter++
+        try {
+            val idName = try {
+                v.resources?.getResourceEntryName(v.id)
+            } catch (_: Throwable) {
+                null
+            }
+            val text = (v as? android.widget.TextView)?.text?.toString()?.take(60)
+            val checked = (v as? android.widget.Checkable)?.isChecked
+            val extra = if (v is android.view.ViewGroup) " children=${v.childCount}" else ""
+            XposedBridge.log("$TAG: $indent${v.javaClass.name} id=$idName text=$text checked=$checked$extra")
+        } catch (_: Throwable) {
+        }
+        if (v is android.view.ViewGroup) {
+            for (i in 0 until v.childCount) {
+                try {
+                    dumpView(v.getChildAt(i), "$indent  ", depth + 1)
+                } catch (_: Throwable) {
+                }
             }
         }
     }
