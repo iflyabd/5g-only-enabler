@@ -70,7 +70,10 @@ object NetModeSettingsHook {
 
     private fun hookDiscovery(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
+        val pkg = lpparam.packageName
         try {
+            // Log EVERY fragment resume (class name only) — guarantees we see the
+            // Preferred Network screen no matter what base class OPlus uses.
             XposedHelpers.findAndHookMethod(
                 "androidx.fragment.app.Fragment",
                 cl,
@@ -78,6 +81,8 @@ object NetModeSettingsHook {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            val name = param.thisObject.javaClass.name
+                            XposedBridge.log("$TAG: frag-resume [$pkg] $name")
                             discover(param.thisObject, cl)
                         } catch (_: Throwable) {
                         }
@@ -88,21 +93,35 @@ object NetModeSettingsHook {
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: discovery hook failed: $e")
         }
+        try {
+            // OPlus screens are often plain Activities — catch those too.
+            XposedHelpers.findAndHookMethod(
+                "android.app.Activity",
+                cl,
+                "onResume",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val act = param.thisObject as? Activity ?: return
+                            XposedBridge.log("$TAG: activity-resume [$pkg] ${act.javaClass.name}")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: activity discovery installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: activity discovery failed: $e")
+        }
     }
 
     private fun discover(fragment: Any, cl: ClassLoader) {
         val name = fragment.javaClass.name
         val lower = name.lowercase()
-        // Always log wirelesssettings screens (small app); elsewhere only watched ones.
-        val pkg = try {
-            fragment.javaClass.`package`?.name ?: ""
-        } catch (_: Throwable) {
-            ""
-        }
+        // Details only for watched screens; the class line itself is always logged.
         val interesting = WATCH.any { lower.contains(it) } ||
-            pkg.contains("wirelesssettings") ||
-            pkg.contains("settings.network") ||
-            pkg.contains("settings.sim")
+            lower.contains("choosenetwork") || lower.contains("networkselect") ||
+            lower.contains("mobilenetwork") || lower.contains("preferred")
         if (!interesting) return
         XposedBridge.log("$TAG: screen fragment=$name")
         try {
