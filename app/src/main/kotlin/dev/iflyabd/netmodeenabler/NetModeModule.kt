@@ -14,6 +14,9 @@ class NetModeModule : IXposedHookLoadPackage {
                 // so it needs the full Settings hooks, not just the framework ones.
                 NetModeSettingsHook.init(lpparam)
                 NetModeFrameworkHook.init(lpparam)
+                if (lpparam.packageName == "com.android.phone") {
+                    OplusPreferredNetworkHook.init(lpparam)
+                }
             }
             "android" -> {
                 NetModeFrameworkHook.init(lpparam)
