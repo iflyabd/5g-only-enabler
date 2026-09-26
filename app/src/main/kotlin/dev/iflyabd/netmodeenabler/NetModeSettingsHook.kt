@@ -209,6 +209,33 @@ object NetModeSettingsHook {
             }
         } catch (_: Throwable) {
         }
+        // Class hierarchy + methods + fields: reveals the exact seam that builds
+        // the radio list (only for the Preferred Network screen to limit noise).
+        if (activity.javaClass.name.contains("PreferredNetwork", ignoreCase = true)) {
+            try {
+                var c: Class<*>? = activity.javaClass
+                var depth = 0
+                while (c != null && c.name != "android.app.Activity" && depth < 8) {
+                    XposedBridge.log("$TAG:   class: ${c.name}")
+                    try {
+                        for (m in c.declaredMethods) {
+                            XposedBridge.log("$TAG:     m: ${m.name}(${m.parameterTypes.joinToString { it.simpleName }}) -> ${m.returnType.simpleName}")
+                        }
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        for (f in c.declaredFields) {
+                            XposedBridge.log("$TAG:     f: ${f.name}: ${f.type.simpleName}")
+                        }
+                    } catch (_: Throwable) {
+                    }
+                    c = c.superclass
+                    depth++
+                }
+            } catch (e: Throwable) {
+                XposedBridge.log("$TAG:   class dump failed: $e")
+            }
+        }
         try {
             val root = activity.findViewById<android.view.View>(android.R.id.content)
             if (root == null) {
