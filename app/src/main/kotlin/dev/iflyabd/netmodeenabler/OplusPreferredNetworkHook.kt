@@ -135,9 +135,17 @@ object OplusPreferredNetworkHook {
             val adapter = XposedHelpers.getObjectField(act, "m")
             if (adapter != null) {
                 adapterClass = adapter.javaClass.name
+                dumpDataFields("adapter", adapter)
                 setArrayFieldsDeep(adapter, newLabels, newValues)
                 try {
+                    val before = XposedHelpers.callMethod(adapter, "getCount")
                     XposedHelpers.callMethod(adapter, "notifyDataSetChanged")
+                    val after = try {
+                        XposedHelpers.callMethod(adapter, "getCount")
+                    } catch (_: Throwable) {
+                        "?"
+                    }
+                    XposedBridge.log("$TAG: adapter count before=$before after=$after")
                 } catch (e: Throwable) {
                     XposedBridge.log("$TAG: notifyDataSetChanged failed: $e")
                 }
@@ -149,7 +157,7 @@ object OplusPreferredNetworkHook {
         wrapClickListener(act)
     }
 
-    /** Set every String[] / Integer[] field on obj (whole hierarchy) to our arrays. */
+    /** Set every String[] / Integer[] / int[] field on obj (whole hierarchy) to our arrays. */
     private fun setArrayFieldsDeep(obj: Any, labels: Array<String>, values: Array<Int>) {
         var c: Class<*>? = obj.javaClass
         while (c != null && c != Object::class.java && !c.name.startsWith("android.app.")) {
@@ -159,14 +167,86 @@ object OplusPreferredNetworkHook {
                     if (t == Array<String>::class.java) {
                         f.isAccessible = true
                         f.set(obj, labels)
+                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = labels[${labels.size}]")
                     } else if (t == Array<Int>::class.java) {
                         f.isAccessible = true
                         f.set(obj, values)
+                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = values[${values.size}]")
+                    } else if (t == IntArray::class.java) {
+                        f.isAccessible = true
+                        f.set(obj, values.toIntArray())
+                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = int[${values.size}]")
+                    } else if (java.util.List::class.java.isAssignableFrom(t)) {
+                        mutateListField(obj, f, labels, values)
                     }
-                } catch (_: Throwable) {
+                } catch (e: Throwable) {
+                    XposedBridge.log("$TAG: set field ${f.name} failed: $e")
                 }
             }
             c = c.superclass
+        }
+    }
+
+    private fun mutateListField(obj: Any, f: java.lang.reflect.Field, labels: Array<String>, values: Array<Int>) {
+        try {
+            f.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val list = f.get(obj) as? MutableList<Any?> ?: return
+            val fname = f.name.lowercase()
+            val looksLabels = fname.contains("label") || fname.contains("title") ||
+                fname.contains("entr") || fname.contains("text") || fname.contains("name") ||
+                fname.contains("string") || fname.contains("item")
+            val looksValues = fname.contains("value") || fname.contains("mode") ||
+                fname.contains("type") || fname.contains("id") || fname.contains("int")
+            val first = list.firstOrNull()
+            val useLabels = when {
+                looksLabels && !looksValues -> true
+                looksValues && !looksLabels -> false
+                first is String -> true
+                first is Int -> false
+                list.isEmpty() && looksLabels -> true
+                list.isEmpty() && looksValues -> false
+                else -> return // unknown list (probably custom items) — leave, dump covers it
+            }
+            list.clear()
+            if (useLabels) {
+                list.addAll(labels.toList())
+            } else {
+                list.addAll(values.toList())
+            }
+            XposedBridge.log("$TAG: set ${obj.javaClass.simpleName}.${f.name} = ${if (useLabels) "labels" else "values"}[${list.size}]")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: mutate list ${f.name} failed: $e")
+        }
+    }
+
+    private val dumpedClasses = mutableSetOf<String>()
+
+    /** One-time dump of an object's data fields (arrays/lists with contents). */
+    private fun dumpDataFields(tag: String, obj: Any) {
+        val cls = obj.javaClass.name
+        if (!dumpedClasses.add(cls)) return
+        try {
+            var c: Class<*>? = obj.javaClass
+            while (c != null && c != Object::class.java && !c.name.startsWith("android.app.")) {
+                for (f in c.declaredFields) {
+                    try {
+                        f.isAccessible = true
+                        val v = f.get(obj)
+                        val summary = when (v) {
+                            is Array<*> -> "Array[${v.size}] first=${v.take(8).map { it.toString() }}"
+                            is IntArray -> "int[${v.size}] first=${v.take(8).toList()}"
+                            is java.util.List<*> -> "List[${v.size}] first=${v.take(8).map { it.toString() }}"
+                            else -> v?.toString()?.take(80)
+                        }
+                        XposedBridge.log("$TAG: $tag ${c.simpleName}.${f.name}: ${f.type.simpleName} = $summary")
+                    } catch (e: Throwable) {
+                        XposedBridge.log("$TAG: $tag dump ${f.name} failed: $e")
+                    }
+                }
+                c = c.superclass
+            }
+        } catch (_: Throwable) {
         }
     }
 
