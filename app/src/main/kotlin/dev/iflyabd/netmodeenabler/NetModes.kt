@@ -109,6 +109,11 @@ object NetModes {
     /** Every observed modem write per subId: "mode:mask:timeMs" (stock + ours). */
     val observedWrites = java.util.concurrent.ConcurrentHashMap<Int, String>()
 
+    /** Last write seen anywhere (mode + sub), the single source of dot truth. */
+    @Volatile var lastWrittenMode: Int = Int.MIN_VALUE
+
+    @Volatile var lastWrittenSub: Int = Int.MIN_VALUE
+
     /** Last successful write per subId: "mode:mask:timeMs" (same-process memory). */
     private val lastWrite = java.util.concurrent.ConcurrentHashMap<Int, String>()
 

@@ -117,12 +117,15 @@ object NetModeFrameworkHook {
                 // This is write-response truth — no re-read, no staleness.
                 try {
                     if (param.method.name == "setAllowedNetworkTypes" && param.args.size == 3) {
-                        val mask = param.args[1] as? Long ?: return
+                        val mask = (param.args[1] as? Number)?.toLong() ?: return
                         val msg = param.args[2] as? android.os.Message ?: return
                         val mode = msg.arg2
                         if (mode in 0..40) {
                             NetModes.observedWrites[msg.arg1] =
                                 "$mode:$mask:${System.currentTimeMillis()}"
+                            NetModes.lastWrittenMode = mode
+                            NetModes.lastWrittenSub = msg.arg1
+                            XposedBridge.log("$TAG: write observed sub=${msg.arg1} mode=$mode mask=$mask")
                         }
                     }
                 } catch (_: Throwable) {

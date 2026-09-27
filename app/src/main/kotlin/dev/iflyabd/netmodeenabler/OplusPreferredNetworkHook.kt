@@ -635,61 +635,52 @@ object OplusPreferredNetworkHook {
      * hold the truth. This pass re-asserts the dot from live modem state after
      * every tap / rebuild. No-op when already correct (no flicker).
      */
+    private val lastScreen = java.util.concurrent.atomic.AtomicReference<java.lang.ref.WeakReference<Activity>>()
+
     private fun scheduleVerify(act: Any) {
         try {
             val activity = act as? Activity ?: return
-            if (XposedHelpers.getAdditionalInstanceField(act, "netmode_verify_at") == "pending") return
-            XposedHelpers.setAdditionalInstanceField(act, "netmode_verify_at", "pending")
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                try {
-                    XposedHelpers.removeAdditionalInstanceField(act, "netmode_verify_at")
-                    if (!activity.isFinishing && !activity.isDestroyed) {
-                        verifyDots(act)
+            lastScreen.set(java.lang.ref.WeakReference(activity))
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            // Two passes: after modem settle, and after any late stock rebuild.
+            // Idempotent: a correct screen is never touched (see enforceDots).
+            for (delay in listOf(800L, 2400L)) {
+                handler.postDelayed({
+                    try {
+                        if (!activity.isFinishing && !activity.isDestroyed) {
+                            verifyDots(activity)
+                        }
+                    } catch (_: Throwable) {
                     }
-                } catch (_: Throwable) {
-                }
-            }, 700)
+                }, delay)
+            }
         } catch (_: Throwable) {
-        }
-    }
-
-    private fun liveRilMode(activity: Activity, subId: Int): Int? {
-        try {
-            val tm = activity.getSystemService(android.telephony.TelephonyManager::class.java) ?: return null
-            // Public API: TelephonyManager.getPreferredNetworkType(int subId)
-            val m = tm.javaClass.methods.firstOrNull {
-                it.name == "getPreferredNetworkType" && it.parameterTypes.size == 1
-            } ?: return null
-            val v = m.invoke(tm, subId) as? Int ?: return null
-            if (v < 0) return null
-            return v
-        } catch (_: Throwable) {
-            return null
         }
     }
 
     private fun verifyDots(act: Any) {
         try {
-            val activity = act as? Activity ?: return
-            val subId = subIdOf(activity)
-            if (subId == Int.MIN_VALUE) return
-            // Write-response truth: the last mode written for this sub (stock or ours).
-            val rec = NetModes.observedWrites[subId]?.split(":")
-            val mode = rec?.getOrNull(0)?.toIntOrNull()
+            val activity = (act as? Activity)
+                ?: lastScreen.get()?.get()
+                ?: return
+            // Primary truth: the last mode actually written to the modem.
+            var mode = NetModes.lastWrittenMode.takeIf { it != Int.MIN_VALUE }
+            var source = "write"
             if (mode == null) {
-                // No write observed in this process life — fall back to live mask read.
-                val live = NetModes.currentMode(activity, subId)
-                if (live == null) return
-                enforceDots(act, live)
-                return
+                val subId = subIdOf(activity)
+                if (subId == Int.MIN_VALUE) return
+                // Fallback: live mask read (ours only).
+                mode = NetModes.currentMode(activity, subId)
+                source = "live"
+                if (mode == null) return
             }
-            enforceDots(act, mode)
+            enforceDots(activity, mode, source)
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: verifyDots failed: $e")
         }
     }
 
-    private fun enforceDots(act: Any, mode: Int) {
+    private fun enforceDots(act: Any, mode: Int, source: String) {
         try {
             @Suppress("UNCHECKED_CAST")
             val values = try {
@@ -734,7 +725,7 @@ object OplusPreferredNetworkHook {
                 }
                 if (i == idx) checkedNow = if (should) label else checkedNow
             }
-            XposedBridge.log("$TAG: verifyDots sub mode=$mode expected='$expected' was='$checkedNow' corrected=$corrected/${cards.size}")
+            XposedBridge.log("$TAG: verifyDots [$source] mode=$mode expected='$expected' was='$checkedNow' corrected=$corrected/${cards.size}")
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: enforceDots failed: $e")
         }
