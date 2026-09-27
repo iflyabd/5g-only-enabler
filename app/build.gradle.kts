@@ -11,8 +11,8 @@ android {
         applicationId = "dev.iflyabd.netmodeenabler"
         minSdk = 28
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.3.0"
+        versionCode = 6
+        versionName = "1.3.1"
     }
 
     buildTypes {

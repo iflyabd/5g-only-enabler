@@ -114,50 +114,68 @@ object OplusPreferredNetworkHook {
     // ---------- check/click telemetry (finds who moves the radio) ----------
 
     private fun hookCheckTelemetry(lpparam: XC_LoadPackage.LoadPackageParam) {
+        val cl = lpparam.classLoader
+        // The rows are COUI cards with their own checked state — watch the setter.
         try {
+            val cardClass = XposedHelpers.findClass(
+                "com.coui.appcompat.cardlist.COUICardListSelectedItemLayout", cl,
+            )
             XposedHelpers.findAndHookMethod(
-                "android.widget.ListView",
-                lpparam.classLoader,
-                "setItemChecked",
-                Int::class.javaPrimitiveType,
+                cardClass,
+                "setChecked",
                 Boolean::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val lv = param.thisObject
-                            val ctx = try {
-                                XposedHelpers.callMethod(lv, "getContext")
-                            } catch (_: Throwable) {
-                                null
-                            }
-                            var actName = ""
-                            var c: Context? = ctx as? Context
-                            while (c is android.content.ContextWrapper) {
-                                if (c.javaClass.name == ACT) {
-                                    actName = c.javaClass.name
-                                    break
-                                }
-                                c = c.baseContext
-                            }
-                            if (actName.isEmpty()) return
-                            val pos = param.args.getOrNull(0)
-                            val checked = param.args.getOrNull(1)
-                            val vals = try {
-                                XposedHelpers.getObjectField(c, "j")
-                            } catch (_: Throwable) {
-                                "?"
-                            }
+                            val checked = param.args.getOrNull(0)
                             val stack = Thread.currentThread().stackTrace
-                                .take(14).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
-                            XposedBridge.log("$TAG: setItemChecked pos=$pos checked=$checked values=$vals || $stack")
+                                .take(16).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: card setChecked=$checked || $stack")
                         } catch (_: Throwable) {
                         }
                     }
                 },
             )
-            XposedBridge.log("$TAG: check telemetry installed")
+            XposedBridge.log("$TAG: card check telemetry installed")
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: check telemetry failed: $e")
+            XposedBridge.log("$TAG: card check telemetry failed: $e")
+        }
+        // The click receiver seen in logs: com.android.simsettings.activity.r1
+        try {
+            val r1 = XposedHelpers.findClass("com.android.simsettings.activity.r1", cl)
+            try {
+                for (m in r1.declaredMethods) {
+                    XposedBridge.log("$TAG: r1 method: ${m.name}(${m.parameterTypes.joinToString { it.simpleName }})")
+                }
+                for (f in r1.declaredFields) {
+                    XposedBridge.log("$TAG: r1 field: ${f.name}: ${f.type.simpleName}")
+                }
+            } catch (_: Throwable) {
+            }
+            XposedHelpers.findAndHookMethod(
+                r1,
+                "onClick",
+                android.view.View::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.args.getOrNull(0) as? android.view.View
+                            val idName = try {
+                                v?.resources?.getResourceEntryName(v.id)
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            val stack = Thread.currentThread().stackTrace
+                                .take(10).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: r1.onClick view=${v?.javaClass?.name} id=$idName || $stack")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: r1 telemetry installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: r1 telemetry failed: $e")
         }
     }
 
@@ -203,32 +221,43 @@ object OplusPreferredNetworkHook {
     // ---------- parent SIM page summary ----------
 
     /**
-     * OplusSimInfoActivity shows "Preferred network type: <label>". Stock maps the
-     * modem mode with a hardcoded table that knows nothing of 27/11/2/29, so after
-     * picking one of our modes the summary goes stale. Override it from live state.
+     * OplusSimInfoActivity does NOT use androidx Preference (the Preference-based
+     * hook never fires), so override at the TextView level, tightly gated:
+     * only inside OplusSimInfoActivity, only when the text is exactly one of the
+     * 4 stock network labels, and only when live modem state matches our mode.
+     * We modify args in beforeHook (no recursion: we never call setText).
      */
+    private val STOCK_LABELS = setOf("5G preferred", "4G preferred", "3G preferred", "2G Only")
+
     private fun hookParentSummary(lpparam: XC_LoadPackage.LoadPackageParam) {
         try {
-            val prefClass = XposedHelpers.findClass("androidx.preference.Preference", lpparam.classLoader)
             XposedHelpers.findAndHookMethod(
-                prefClass,
-                "setSummary",
+                "android.widget.TextView",
+                lpparam.classLoader,
+                "setText",
                 CharSequence::class.java,
                 object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val pref = param.thisObject
-                            val title = (XposedHelpers.callMethod(pref, "getTitle") as? CharSequence)?.toString()
-                                ?: return
-                            if (!title.contains("preferred network", ignoreCase = true)) return
-                            val ctx = XposedHelpers.callMethod(pref, "getContext") as? Context ?: return
-                            val subId = activitySubId(ctx)
-                            val mode = NetModes.currentMode(ctx, subId) ?: return
+                            val newText = (param.args.getOrNull(0) as? CharSequence)?.toString()
+                            if (newText == null || !STOCK_LABELS.contains(newText)) return
+                            val tv = param.thisObject as? android.widget.TextView ?: return
+                            var c: Context? = tv.context
+                            var act: Activity? = null
+                            while (c is android.content.ContextWrapper) {
+                                if (c is Activity) {
+                                    act = c
+                                    break
+                                }
+                                c = c.baseContext
+                            }
+                            if (act == null || !act.javaClass.name.contains("OplusSimInfo")) return
+                            val subId = activitySubId(act)
+                            val mode = NetModes.currentMode(act, subId) ?: return
                             val label = NetModes.labelFor(mode) ?: return
-                            val cur = (XposedHelpers.callMethod(pref, "getSummary") as? CharSequence)?.toString()
-                            if (cur == label) return
-                            XposedBridge.log("$TAG: parent summary sub=$subId -> $label")
-                            XposedHelpers.callMethod(pref, "setSummary", label)
+                            if (newText == label) return
+                            XposedBridge.log("$TAG: parent summary sub=$subId '$newText' -> '$label'")
+                            param.args[0] = label
                         } catch (_: Throwable) {
                         }
                     }
