@@ -106,6 +106,9 @@ object NetModes {
     /** Known stock masks (mode -> mask), captured from the modem's write path. */
     private val STOCK_MASKS = mapOf(33 to 916479L, 9 to 316295L, 1 to 32771L)
 
+    /** Every observed modem write per subId: "mode:mask:timeMs" (stock + ours). */
+    val observedWrites = java.util.concurrent.ConcurrentHashMap<Int, String>()
+
     /** Last successful write per subId: "mode:mask:timeMs" (same-process memory). */
     private val lastWrite = java.util.concurrent.ConcurrentHashMap<Int, String>()
 

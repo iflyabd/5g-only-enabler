@@ -413,14 +413,14 @@ object OplusPreferredNetworkHook {
             refreshCheck(act, newValues)
             return
         }
-        setArrayFieldsDeep(act, newLabels, newValues)
+        setArrayFieldsDeep(act, newLabels, newValues, false)
         var adapterClass = "?"
         try {
             val adapter = XposedHelpers.getObjectField(act, "m")
             if (adapter != null) {
                 adapterClass = adapter.javaClass.name
                 dumpDataFields("adapter", adapter)
-                setArrayFieldsDeep(adapter, newLabels, newValues)
+                setArrayFieldsDeep(adapter, newLabels, newValues, true)
                 try {
                     val before = XposedHelpers.callMethod(adapter, "getCount")
                     XposedHelpers.callMethod(adapter, "notifyDataSetChanged")
@@ -469,64 +469,57 @@ object OplusPreferredNetworkHook {
         }
     }
 
-    /** Set every String[] / Integer[] / int[] field on obj (whole hierarchy) to our arrays. */
-    private fun setArrayFieldsDeep(obj: Any, labels: Array<String>, values: Array<Int>) {
-        var c: Class<*>? = obj.javaClass
-        while (c != null && c != Object::class.java && !c.name.startsWith("android.app.")) {
-            for (f in c.declaredFields) {
+    /**
+     * Targeted writes only: activity fields i (String[]) / j (Integer[]) and the
+     * adapter's mObjects list. The old hierarchy walk touched framework listener
+     * lists — never again.
+     */
+    private fun setArrayFieldsDeep(obj: Any, labels: Array<String>, values: Array<Int>, isAdapter: Boolean) {
+        if (!isAdapter) {
+            try {
+                val cls = obj.javaClass
                 try {
-                    val t = f.type
-                    if (t == Array<String>::class.java) {
-                        f.isAccessible = true
-                        f.set(obj, labels)
-                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = labels[${labels.size}]")
-                    } else if (t == Array<Int>::class.java) {
-                        f.isAccessible = true
-                        f.set(obj, values)
-                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = values[${values.size}]")
-                    } else if (t == IntArray::class.java) {
-                        f.isAccessible = true
-                        f.set(obj, values.toIntArray())
-                        XposedBridge.log("$TAG: set ${c.simpleName}.${f.name} = int[${values.size}]")
-                    } else if (java.util.List::class.java.isAssignableFrom(t)) {
-                        mutateListField(obj, f, labels, values)
+                    val fi = cls.getDeclaredField("i")
+                    if (fi.type == Array<String>::class.java) {
+                        fi.isAccessible = true
+                        fi.set(obj, labels)
                     }
-                } catch (e: Throwable) {
-                    XposedBridge.log("$TAG: set field ${f.name} failed: $e")
+                } catch (_: Throwable) {
                 }
+                try {
+                    val fj = cls.getDeclaredField("j")
+                    if (fj.type == Array<Int>::class.java) {
+                        fj.isAccessible = true
+                        fj.set(obj, values)
+                    }
+                } catch (_: Throwable) {
+                }
+            } catch (_: Throwable) {
             }
-            c = c.superclass
+            return
         }
-    }
-
-    private fun mutateListField(obj: Any, f: java.lang.reflect.Field, labels: Array<String>, values: Array<Int>) {
-        try {
-            f.isAccessible = true
-            @Suppress("UNCHECKED_CAST")
-            val list = f.get(obj) as? List<*> ?: return
-            val fname = f.name.lowercase()
-            val looksLabels = fname.contains("label") || fname.contains("title") ||
-                fname.contains("entr") || fname.contains("text") || fname.contains("name") ||
-                fname.contains("string") || fname.contains("item") || fname.contains("object")
-            val looksValues = fname.contains("value") || fname.contains("mode") ||
-                fname.contains("type") || fname.contains("id") || fname.contains("int")
-            val first = list.firstOrNull()
-            val useLabels = when {
-                looksLabels && !looksValues -> true
-                looksValues && !looksLabels -> false
-                first is String -> true
-                first is Int -> false
-                list.isEmpty() && looksLabels -> true
-                list.isEmpty() && looksValues -> false
-                else -> return // unknown list (probably custom items) — leave, dump covers it
+        var c: Class<*>? = obj.javaClass
+        while (c != null && c != Object::class.java) {
+            try {
+                val f = c.getDeclaredField("mObjects")
+                f.isAccessible = true
+                val cur = try {
+                    f.get(obj)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (cur is java.util.List<*>) {
+                    val first = cur.firstOrNull()
+                    if (first is String || cur.isEmpty()) {
+                        f.set(obj, java.util.ArrayList<Any?>(labels.toList()))
+                        XposedBridge.log("$TAG: set ${c.simpleName}.mObjects = labels[${labels.size}] (replaced)")
+                        return
+                    }
+                }
+            } catch (_: Throwable) {
             }
-            // REPLACE the reference: ArrayAdapter wraps arrays with fixed-size
-            // Arrays.asList, whose clear()/add() throw. A fresh ArrayList works.
-            val newData = java.util.ArrayList<Any?>(if (useLabels) labels.toList() else values.toList())
-            f.set(obj, newData)
-            XposedBridge.log("$TAG: set ${obj.javaClass.simpleName}.${f.name} = ${if (useLabels) "labels" else "values"}[${newData.size}] (replaced)")
-        } catch (e: Throwable) {
-            XposedBridge.log("$TAG: mutate list ${f.name} failed: $e")
+            if (c.name.startsWith("android.widget.ArrayAdapter")) break
+            c = c.superclass
         }
     }
 
@@ -680,7 +673,24 @@ object OplusPreferredNetworkHook {
             val activity = act as? Activity ?: return
             val subId = subIdOf(activity)
             if (subId == Int.MIN_VALUE) return
-            val mode = liveRilMode(activity, subId) ?: return
+            // Write-response truth: the last mode written for this sub (stock or ours).
+            val rec = NetModes.observedWrites[subId]?.split(":")
+            val mode = rec?.getOrNull(0)?.toIntOrNull()
+            if (mode == null) {
+                // No write observed in this process life — fall back to live mask read.
+                val live = NetModes.currentMode(activity, subId)
+                if (live == null) return
+                enforceDots(act, live)
+                return
+            }
+            enforceDots(act, mode)
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: verifyDots failed: $e")
+        }
+    }
+
+    private fun enforceDots(act: Any, mode: Int) {
+        try {
             @Suppress("UNCHECKED_CAST")
             val values = try {
                 XposedHelpers.getObjectField(act, "j") as? Array<Int>
@@ -696,6 +706,7 @@ object OplusPreferredNetworkHook {
             val idx = values.indexOf(mode)
             if (idx < 0) return
             val expected = labels.getOrNull(idx) ?: return
+            val activity = act as? Activity ?: return
             val root = try {
                 activity.findViewById<android.view.View>(android.R.id.content)
             } catch (_: Throwable) {
@@ -704,25 +715,28 @@ object OplusPreferredNetworkHook {
             val cards = mutableListOf<android.view.View>()
             collectCards(root, cards)
             var corrected = 0
-            for (card in cards) {
+            var checkedNow = "?"
+            for ((i, card) in cards.withIndex()) {
                 val texts = mutableListOf<String>()
                 collectTexts(card, texts, 0)
                 val label = texts.firstOrNull { t ->
                     t.contains("5G") || t.contains("4G") || t.contains("3G") || t.contains("2G")
                 } ?: continue
-                val dot = findDot(card) ?: continue
                 val should = label == expected
                 try {
-                    if (dot.isChecked != should) {
-                        dot.isChecked = should
+                    val cur = XposedHelpers.callMethod(card, "getIsSelected") as? Boolean
+                    if (cur == true && should) checkedNow = label
+                    if (cur != should) {
+                        XposedHelpers.callMethod(card, "setIsSelected", should)
                         corrected++
                     }
                 } catch (_: Throwable) {
                 }
+                if (i == idx) checkedNow = if (should) label else checkedNow
             }
-            XposedBridge.log("$TAG: verifyDots sub=$subId mode=$mode expected='$expected' corrected=$corrected/${cards.size}")
+            XposedBridge.log("$TAG: verifyDots sub mode=$mode expected='$expected' was='$checkedNow' corrected=$corrected/${cards.size}")
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: verifyDots failed: $e")
+            XposedBridge.log("$TAG: enforceDots failed: $e")
         }
     }
 

@@ -112,6 +112,21 @@ object NetModeFrameworkHook {
                     XposedBridge.log("$TAG: -> result=${param.result}")
                 } catch (_: Throwable) {
                 }
+                // Record every modem write: setAllowedNetworkTypes(reason, mask, msg)
+                // carries the RIL mode in msg.arg2 and the subId in msg.arg1.
+                // This is write-response truth — no re-read, no staleness.
+                try {
+                    if (param.method.name == "setAllowedNetworkTypes" && param.args.size == 3) {
+                        val mask = param.args[1] as? Long ?: return
+                        val msg = param.args[2] as? android.os.Message ?: return
+                        val mode = msg.arg2
+                        if (mode in 0..40) {
+                            NetModes.observedWrites[msg.arg1] =
+                                "$mode:$mask:${System.currentTimeMillis()}"
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
             }
         }
         for (cls in listOf(
