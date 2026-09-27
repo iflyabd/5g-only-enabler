@@ -120,17 +120,31 @@ object OplusPreferredNetworkHook {
             val cardClass = XposedHelpers.findClass(
                 "com.coui.appcompat.cardlist.COUICardListSelectedItemLayout", cl,
             )
+            if (!dumpedClasses.add("cardmethods")) {
+            } else {
+                try {
+                    for (m in cardClass.declaredMethods) {
+                        XposedBridge.log("$TAG: card method: ${m.name}(${m.parameterTypes.joinToString { it.simpleName }})")
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            // Radio dots are usually selected-state drawables: watch View.setSelected.
             XposedHelpers.findAndHookMethod(
-                cardClass,
-                "setChecked",
+                "android.view.View",
+                cl,
+                "setSelected",
                 Boolean::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val checked = param.args.getOrNull(0)
+                            val v = param.thisObject as? android.view.View ?: return
+                            if (!v.javaClass.name.contains("COUICard")) return
+                            val sel = param.args.getOrNull(0)
                             val stack = Thread.currentThread().stackTrace
-                                .take(16).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
-                            XposedBridge.log("$TAG: card setChecked=$checked || $stack")
+                                .filter { !it.className.contains("Xposed") && !it.className.contains("LSPosed") && !it.className.contains("HookBridge") && !it.className.contains("LSPHooker") }
+                                .take(12).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: card setSelected=$sel || $stack")
                         } catch (_: Throwable) {
                         }
                     }
@@ -165,9 +179,20 @@ object OplusPreferredNetworkHook {
                             } catch (_: Throwable) {
                                 null
                             }
+                            val a = try {
+                                XposedHelpers.getIntField(param.thisObject, "a")
+                            } catch (_: Throwable) {
+                                -999
+                            }
+                            val b = try {
+                                XposedHelpers.getIntField(param.thisObject, "b")
+                            } catch (_: Throwable) {
+                                -999
+                            }
                             val stack = Thread.currentThread().stackTrace
-                                .take(10).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
-                            XposedBridge.log("$TAG: r1.onClick view=${v?.javaClass?.name} id=$idName || $stack")
+                                .filter { !it.className.contains("Xposed") && !it.className.contains("LSPosed") && !it.className.contains("HookBridge") && !it.className.contains("LSPHooker") }
+                                .take(12).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: r1.onClick a=$a b=$b view=${v?.javaClass?.name} id=$idName || $stack")
                         } catch (_: Throwable) {
                         }
                     }
