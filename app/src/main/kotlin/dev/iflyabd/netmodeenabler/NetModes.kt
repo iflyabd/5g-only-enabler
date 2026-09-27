@@ -51,8 +51,11 @@ object NetModes {
     fun maskFor(networkMode: Int, tmClass: Class<*>? = null): Long {
         // Exact OPlus/RIL masks, captured from this modem's own write path
         // (Phone.setAllowedNetworkTypes arg2=mode). Standard AOSP RAF values.
+        // NOTE: NR_ONLY is deliberately STRICT (NR bit alone): the user demands
+        // "5G Only means 5G only" — no LTE/UTMS fallback bits. Where no NR/SA
+        // exists this shows No Service instead of silently camping LTE.
         when (networkMode) {
-            NR_ONLY -> return 850943L // NR + LTE_CA + TD/GSM/HSPAP/LTE/EHRPD + UMTS-family/EDGE/GPRS/CDMA-group
+            NR_ONLY -> return 524288L // NR alone (strict)
             NR_LTE -> return 856064L // NR + LTE_CA + IWLAN + LTE
             LTE_ONLY -> return 266240L // LTE_CA + LTE
             WCDMA_ONLY -> return 17284L // GSM + HSPA/HSUPA/HSDPA/UMTS

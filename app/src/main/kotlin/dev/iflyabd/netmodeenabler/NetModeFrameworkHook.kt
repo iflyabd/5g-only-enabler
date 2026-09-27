@@ -156,5 +156,50 @@ object NetModeFrameworkHook {
             } catch (_: Throwable) {
             }
         }
+        hookStrictNrOnly(lpparam)
+    }
+
+    /**
+     * "5G Only means 5G only": every modem write for RIL mode 27 gets its mask
+     * tightened to the NR bit alone (524288), no LTE/UMTS fallback bits. All
+     * write paths (Settings UI, dialer codes, ours) flow through
+     * Phone.setAllowedNetworkTypes, so this single choke point covers them all.
+     * Where no NR/SA exists the modem will show No Service instead of LTE.
+     */
+    private fun hookStrictNrOnly(lpparam: XC_LoadPackage.LoadPackageParam) {
+        if (lpparam.packageName != "com.android.phone") return
+        try {
+            val clazz = XposedHelpers.findClass("com.android.internal.telephony.Phone", lpparam.classLoader)
+            var n = 0
+            for (m in clazz.declaredMethods) {
+                if (m.name != "setAllowedNetworkTypes" || m.parameterTypes.size != 3) continue
+                // 3rd param must be a Message carrying arg2=mode.
+                if (!android.os.Message::class.java.isAssignableFrom(m.parameterTypes[2])) continue
+                try {
+                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            try {
+                                val msg = param.args[2] as? android.os.Message ?: return
+                                if (msg.arg2 != NetModes.NR_ONLY) return
+                                val strict = NetModes.maskFor(NetModes.NR_ONLY)
+                                val p1 = (param.method as? java.lang.reflect.Method)?.parameterTypes?.getOrNull(1)
+                                param.args[1] = when (p1) {
+                                    Int::class.javaPrimitiveType, Integer::class.java -> strict.toInt()
+                                    else -> strict
+                                }
+                                XposedBridge.log("$TAG: tightened NR_ONLY sub=${msg.arg1} mask -> $strict")
+                            } catch (e: Throwable) {
+                                XposedBridge.log("$TAG: tighten failed: $e")
+                            }
+                        }
+                    })
+                    n++
+                } catch (_: Throwable) {
+                }
+            }
+            XposedBridge.log("$TAG: strict NR hook on $n overloads")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: strict NR hook failed: $e")
+        }
     }
 }
