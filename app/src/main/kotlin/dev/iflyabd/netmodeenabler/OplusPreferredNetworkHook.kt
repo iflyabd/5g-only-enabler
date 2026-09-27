@@ -106,7 +106,98 @@ object OplusPreferredNetworkHook {
             XposedBridge.log("$TAG: OPlus apply hooks failed: $e")
         }
         hookParentSummary(lpparam)
+        hookCheckTelemetry(lpparam)
+        hookClickTelemetry(lpparam)
         XposedBridge.log("$TAG: OPlus preferred-network hooks installed")
+    }
+
+    // ---------- check/click telemetry (finds who moves the radio) ----------
+
+    private fun hookCheckTelemetry(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.widget.ListView",
+                lpparam.classLoader,
+                "setItemChecked",
+                Int::class.javaPrimitiveType,
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val lv = param.thisObject
+                            val ctx = try {
+                                XposedHelpers.callMethod(lv, "getContext")
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            var actName = ""
+                            var c: Context? = ctx as? Context
+                            while (c is android.content.ContextWrapper) {
+                                if (c.javaClass.name == ACT) {
+                                    actName = c.javaClass.name
+                                    break
+                                }
+                                c = c.baseContext
+                            }
+                            if (actName.isEmpty()) return
+                            val pos = param.args.getOrNull(0)
+                            val checked = param.args.getOrNull(1)
+                            val vals = try {
+                                XposedHelpers.getObjectField(c, "j")
+                            } catch (_: Throwable) {
+                                "?"
+                            }
+                            val stack = Thread.currentThread().stackTrace
+                                .take(14).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: setItemChecked pos=$pos checked=$checked values=$vals || $stack")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: check telemetry installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: check telemetry failed: $e")
+        }
+    }
+
+    private fun hookClickTelemetry(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.view.View",
+                lpparam.classLoader,
+                "performClick",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.thisObject as? android.view.View ?: return
+                            var c: Context? = v.context
+                            var found = false
+                            while (c is android.content.ContextWrapper) {
+                                if (c.javaClass.name == ACT) {
+                                    found = true
+                                    break
+                                }
+                                c = c.baseContext
+                            }
+                            if (!found) return
+                            val text = (v as? android.widget.TextView)?.text?.toString()?.take(40)
+                            val listener = try {
+                                val li = XposedHelpers.getObjectField(v, "mListenerInfo")
+                                XposedHelpers.getObjectField(li, "mOnClickListener")?.javaClass?.name
+                            } catch (_: Throwable) {
+                                "?"
+                            }
+                            XposedBridge.log("$TAG: click view=${v.javaClass.name} text=$text listener=$listener")
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: click telemetry installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: click telemetry failed: $e")
+        }
     }
 
     // ---------- parent SIM page summary ----------

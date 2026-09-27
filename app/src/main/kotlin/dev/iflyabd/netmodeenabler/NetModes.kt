@@ -49,6 +49,14 @@ object NetModes {
 
     /** Bitmask that enables exactly [networkMode]'s radio techs. */
     fun maskFor(networkMode: Int, tmClass: Class<*>? = null): Long {
+        // Exact OPlus/RIL masks, captured from this modem's own write path
+        // (Phone.setAllowedNetworkTypes arg2=mode). Standard AOSP RAF values.
+        when (networkMode) {
+            NR_ONLY -> return 850943L // NR + LTE_CA + TD/GSM/HSPAP/LTE/EHRPD + UMTS-family/EDGE/GPRS/CDMA-group
+            NR_LTE -> return 856064L // NR + LTE_CA + IWLAN + LTE
+            LTE_ONLY -> return 266240L // LTE_CA + LTE
+            WCDMA_ONLY -> return 17284L // GSM + HSPA/HSUPA/HSDPA/UMTS
+        }
         val cls = tmClass ?: try {
             TelephonyManager::class.java
         } catch (_: Throwable) {
@@ -95,6 +103,12 @@ object NetModes {
         }
     }
 
+    /** Known stock masks (mode -> mask), captured from the modem's write path. */
+    private val STOCK_MASKS = mapOf(33 to 916479L, 9 to 316295L, 1 to 32771L)
+
+    /** Last successful write per subId: "mode:mask:timeMs" (same-process memory). */
+    private val lastWrite = java.util.concurrent.ConcurrentHashMap<Int, String>()
+
     /**
      * Read back the modem's USER-reason allowed mask for [subId] and map it to
      * one of our 4 modes. Returns null for any stock/unknown state (leave UI alone).
@@ -115,8 +129,25 @@ object NetModes {
             } catch (_: Throwable) {
                 null
             } ?: return null
+            // 1. Exact match to our modes.
             for (mode in listOf(NR_ONLY, NR_LTE, LTE_ONLY, WCDMA_ONLY)) {
                 if (mask == maskFor(mode, subTm.javaClass)) return mode
+            }
+            // 2. Exact match to a known stock state -> definitely not ours.
+            if (STOCK_MASKS.values.any { it == mask }) return null
+            // 3. Recent write by us + live mask is a supermask of it (modem OR-ed
+            //    extra bits) -> still ours. Only trusted for 120 s after the tap.
+            try {
+                val parts = lastWrite[subId]?.split(":") ?: return null
+                if (parts.size != 3) return null
+                val sm = parts[0].toIntOrNull() ?: return null
+                val smm = parts[1].toLongOrNull() ?: return null
+                val t = parts[2].toLongOrNull() ?: return null
+                if (System.currentTimeMillis() - t > 120_000) return null
+                if (sm in listOf(NR_ONLY, NR_LTE, LTE_ONLY, WCDMA_ONLY) && (mask and smm) == smm) {
+                    return sm
+                }
+            } catch (_: Throwable) {
             }
         } catch (_: Throwable) {
         }
@@ -147,7 +178,10 @@ object NetModes {
                 if (m != null) {
                     val ok = m.invoke(subTm, reasonUser(subTm.javaClass), mask) as? Boolean ?: false
                     XposedBridge.log("NetModeEnabler: setAllowedNetworkTypesForReason sub=$subId mode=$networkMode mask=$mask -> $ok")
-                    if (ok) return true
+                    if (ok) {
+                        lastWrite[subId] = "$networkMode:$mask:${System.currentTimeMillis()}"
+                        return true
+                    }
                 }
             } catch (e: Throwable) {
                 XposedBridge.log("NetModeEnabler: allowed-types path failed: $e")
