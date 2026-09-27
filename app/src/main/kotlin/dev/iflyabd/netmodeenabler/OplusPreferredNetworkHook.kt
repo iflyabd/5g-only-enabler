@@ -129,22 +129,31 @@ object OplusPreferredNetworkHook {
                 } catch (_: Throwable) {
                 }
             }
-            // Radio dots are usually selected-state drawables: watch View.setSelected.
             XposedHelpers.findAndHookMethod(
-                "android.view.View",
-                cl,
-                "setSelected",
+                cardClass,
+                "setIsSelected",
                 Boolean::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val v = param.thisObject as? android.view.View ?: return
-                            if (!v.javaClass.name.contains("COUICard")) return
                             val sel = param.args.getOrNull(0)
+                            // Which row? Find our card's label text via siblings.
+                            var label = "?"
+                            try {
+                                val card = param.thisObject as? android.view.ViewGroup
+                                if (card != null) {
+                                    val texts = mutableListOf<String>()
+                                    collectTexts(card, texts, 0)
+                                    label = texts.firstOrNull { t ->
+                                        t.contains("5G") || t.contains("4G") || t.contains("3G") || t.contains("2G")
+                                    } ?: texts.firstOrNull() ?: "?"
+                                }
+                            } catch (_: Throwable) {
+                            }
                             val stack = Thread.currentThread().stackTrace
                                 .filter { !it.className.contains("Xposed") && !it.className.contains("LSPosed") && !it.className.contains("HookBridge") && !it.className.contains("LSPHooker") }
-                                .take(12).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
-                            XposedBridge.log("$TAG: card setSelected=$sel || $stack")
+                                .take(14).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
+                            XposedBridge.log("$TAG: card setIsSelected row='$label' sel=$sel || $stack")
                         } catch (_: Throwable) {
                         }
                     }
@@ -627,6 +636,24 @@ object OplusPreferredNetworkHook {
             }
         } catch (_: Throwable) {
             false
+        }
+    }
+
+    private fun collectTexts(v: android.view.View, out: MutableList<String>, depth: Int) {
+        if (depth > 6 || out.size > 8) return
+        try {
+            (v as? android.widget.TextView)?.text?.toString()?.take(40)?.let {
+                if (it.isNotBlank()) out.add(it)
+            }
+        } catch (_: Throwable) {
+        }
+        if (v is android.view.ViewGroup) {
+            for (i in 0 until v.childCount) {
+                try {
+                    collectTexts(v.getChildAt(i), out, depth + 1)
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
