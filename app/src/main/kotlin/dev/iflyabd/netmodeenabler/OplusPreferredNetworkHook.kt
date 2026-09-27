@@ -108,8 +108,11 @@ object OplusPreferredNetworkHook {
         hookParentSummary(lpparam)
         hookCheckTelemetry(lpparam)
         hookClickTelemetry(lpparam)
+        hookDotEnforcer(lpparam)
         XposedBridge.log("$TAG: OPlus preferred-network hooks installed")
     }
+
+    // ---------- helpers ----------
 
     // ---------- check/click telemetry (finds who moves the radio) ----------
 
@@ -202,6 +205,21 @@ object OplusPreferredNetworkHook {
                                 .filter { !it.className.contains("Xposed") && !it.className.contains("LSPosed") && !it.className.contains("HookBridge") && !it.className.contains("LSPHooker") }
                                 .take(12).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
                             XposedBridge.log("$TAG: r1.onClick a=$a b=$b view=${v?.javaClass?.name} id=$idName || $stack")
+                        } catch (_: Throwable) {
+                        }
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.args.getOrNull(0) as? android.view.View ?: return
+                            var c: Context? = v.context
+                            while (c is android.content.ContextWrapper) {
+                                if (c.javaClass.name == ACT) {
+                                    scheduleVerify(c)
+                                    return
+                                }
+                                c = c.baseContext
+                            }
                         } catch (_: Throwable) {
                         }
                     }
@@ -422,6 +440,7 @@ object OplusPreferredNetworkHook {
         XposedBridge.log("$TAG: OPlus list extended (adapter=$adapterClass): ${newLabels.toList()} / ${newValues.toList()}")
         wrapClickListener(act)
         refreshCheck(act, newValues)
+        scheduleVerify(act)
     }
 
     /** Point the list's checked row at the live modem mode (best-effort). */
@@ -615,7 +634,159 @@ object OplusPreferredNetworkHook {
         }
     }
 
-    // ---------- helpers ----------
+    // ---------- truth enforcement: dots follow the live modem, always ----------
+
+    /**
+     * Stock updates the radio dot from a stale read (modem hasn't applied the tap
+     * yet), so the dot can land on the wrong row while the modem + parent page
+     * hold the truth. This pass re-asserts the dot from live modem state after
+     * every tap / rebuild. No-op when already correct (no flicker).
+     */
+    private fun scheduleVerify(act: Any) {
+        try {
+            val activity = act as? Activity ?: return
+            if (XposedHelpers.getAdditionalInstanceField(act, "netmode_verify_at") == "pending") return
+            XposedHelpers.setAdditionalInstanceField(act, "netmode_verify_at", "pending")
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    XposedHelpers.removeAdditionalInstanceField(act, "netmode_verify_at")
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        verifyDots(act)
+                    }
+                } catch (_: Throwable) {
+                }
+            }, 700)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun liveRilMode(activity: Activity, subId: Int): Int? {
+        try {
+            val tm = activity.getSystemService(android.telephony.TelephonyManager::class.java) ?: return null
+            // Public API: TelephonyManager.getPreferredNetworkType(int subId)
+            val m = tm.javaClass.methods.firstOrNull {
+                it.name == "getPreferredNetworkType" && it.parameterTypes.size == 1
+            } ?: return null
+            val v = m.invoke(tm, subId) as? Int ?: return null
+            if (v < 0) return null
+            return v
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+
+    private fun verifyDots(act: Any) {
+        try {
+            val activity = act as? Activity ?: return
+            val subId = subIdOf(activity)
+            if (subId == Int.MIN_VALUE) return
+            val mode = liveRilMode(activity, subId) ?: return
+            @Suppress("UNCHECKED_CAST")
+            val values = try {
+                XposedHelpers.getObjectField(act, "j") as? Array<Int>
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            @Suppress("UNCHECKED_CAST")
+            val labels = try {
+                XposedHelpers.getObjectField(act, "i") as? Array<String>
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            val idx = values.indexOf(mode)
+            if (idx < 0) return
+            val expected = labels.getOrNull(idx) ?: return
+            val root = try {
+                activity.findViewById<android.view.View>(android.R.id.content)
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            val cards = mutableListOf<android.view.View>()
+            collectCards(root, cards)
+            var corrected = 0
+            for (card in cards) {
+                val texts = mutableListOf<String>()
+                collectTexts(card, texts, 0)
+                val label = texts.firstOrNull { t ->
+                    t.contains("5G") || t.contains("4G") || t.contains("3G") || t.contains("2G")
+                } ?: continue
+                val dot = findDot(card) ?: continue
+                val should = label == expected
+                try {
+                    if (dot.isChecked != should) {
+                        dot.isChecked = should
+                        corrected++
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            XposedBridge.log("$TAG: verifyDots sub=$subId mode=$mode expected='$expected' corrected=$corrected/${cards.size}")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: verifyDots failed: $e")
+        }
+    }
+
+    private fun collectCards(v: android.view.View, out: MutableList<android.view.View>) {
+        try {
+            if (v.javaClass.name.contains("COUICardListSelectedItem")) {
+                out.add(v)
+                return
+            }
+        } catch (_: Throwable) {
+        }
+        if (v is android.view.ViewGroup) {
+            for (i in 0 until v.childCount) {
+                try {
+                    collectCards(v.getChildAt(i), out)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+    }
+
+    private fun findDot(card: android.view.View): android.widget.CompoundButton? {
+        if (card is android.widget.CompoundButton) return card
+        if (card is android.view.ViewGroup) {
+            for (i in 0 until card.childCount) {
+                try {
+                    findDot(card.getChildAt(i))?.let { return it }
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        return null
+    }
+
+    private fun hookDotEnforcer(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // After stock touches any dot in our screen, schedule a truth pass.
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.widget.CompoundButton",
+                lpparam.classLoader,
+                "setChecked",
+                Boolean::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val v = param.thisObject as? android.view.View ?: return
+                            var c: Context? = v.context
+                            while (c is android.content.ContextWrapper) {
+                                if (c.javaClass.name == ACT) {
+                                    scheduleVerify(c)
+                                    return
+                                }
+                                c = c.baseContext
+                            }
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: dot enforcer installed")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: dot enforcer failed: $e")
+        }
+    }
 
     private fun findExtraMode(args: Array<out Any?>): Int? {
         for (a in args) {
