@@ -56,7 +56,9 @@ object NetModeSettingsHook {
         hookFragments(lpparam)
         hookDiscovery(lpparam)
         hookControllers(lpparam)
-        hookAllowedTypes(lpparam)
+        // NOTE: no getAllowedNetworkTypesForReason widening — on OPlus the
+        // Preferred Network screen reads true modem state to match rows, and
+        // OR-ing extra bits corrupts stock row matching. Reads stay truthful.
         NetModeFrameworkHook.hookCarrierUnhide(lpparam)
         XposedBridge.log("$TAG: settings hooks installed in ${lpparam.packageName}")
     }
@@ -665,34 +667,6 @@ object NetModeSettingsHook {
             } catch (e: Throwable) {
                 XposedBridge.log("$TAG: $cls hook skipped (generic wrapper covers it): $e")
             }
-        }
-    }
-
-    // ---------- 4. widen allowed-types so stock entries stay visible ----------
-
-    private fun hookAllowedTypes(lpparam: XC_LoadPackage.LoadPackageParam) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                "android.telephony.TelephonyManager",
-                lpparam.classLoader,
-                "getAllowedNetworkTypesForReason",
-                Int::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            val cur = param.result as? Long ?: return
-                            val full = NetModes.fullMask(param.thisObject.javaClass)
-                            if ((cur and full) != full) {
-                                param.result = cur or full
-                            }
-                        } catch (_: Throwable) {
-                        }
-                    }
-                },
-            )
-            XposedBridge.log("$TAG: hooked TelephonyManager.getAllowedNetworkTypesForReason")
-        } catch (e: Throwable) {
-            XposedBridge.log("$TAG: allowed-types hook failed: $e")
         }
     }
 }

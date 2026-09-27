@@ -105,10 +105,122 @@ object OplusPreferredNetworkHook {
         } catch (e: Throwable) {
             XposedBridge.log("$TAG: OPlus apply hooks failed: $e")
         }
+        hookParentSummary(lpparam)
         XposedBridge.log("$TAG: OPlus preferred-network hooks installed")
     }
 
+    // ---------- parent SIM page summary ----------
+
+    /**
+     * OplusSimInfoActivity shows "Preferred network type: <label>". Stock maps the
+     * modem mode with a hardcoded table that knows nothing of 27/11/2/29, so after
+     * picking one of our modes the summary goes stale. Override it from live state.
+     */
+    private fun hookParentSummary(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            val prefClass = XposedHelpers.findClass("androidx.preference.Preference", lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                prefClass,
+                "setSummary",
+                CharSequence::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            val pref = param.thisObject
+                            val title = (XposedHelpers.callMethod(pref, "getTitle") as? CharSequence)?.toString()
+                                ?: return
+                            if (!title.contains("preferred network", ignoreCase = true)) return
+                            val ctx = XposedHelpers.callMethod(pref, "getContext") as? Context ?: return
+                            val subId = activitySubId(ctx)
+                            val mode = NetModes.currentMode(ctx, subId) ?: return
+                            val label = NetModes.labelFor(mode) ?: return
+                            val cur = (XposedHelpers.callMethod(pref, "getSummary") as? CharSequence)?.toString()
+                            if (cur == label) return
+                            XposedBridge.log("$TAG: parent summary sub=$subId -> $label")
+                            XposedHelpers.callMethod(pref, "setSummary", label)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+            XposedBridge.log("$TAG: hooked parent summary")
+        } catch (e: Throwable) {
+            XposedBridge.log("$TAG: parent summary hook failed: $e")
+        }
+    }
+
+    private fun activitySubId(context: Context): Int {
+        var ctx: Context? = context
+        var activity: Activity? = null
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is Activity) {
+                activity = ctx
+                break
+            }
+            ctx = ctx.baseContext
+        }
+        activity?.intent?.let { intent ->
+            try {
+                val sub = intent.getIntExtra("subscription", Int.MIN_VALUE)
+                if (sub != Int.MIN_VALUE && sub >= 0) return sub
+            } catch (_: Throwable) {
+            }
+            // Parent SIM page carries slotId/simid instead — map slot to subId.
+            try {
+                val slot = intent.getIntExtra("slotId", Int.MIN_VALUE)
+                if (slot != Int.MIN_VALUE && slot >= 0) {
+                    val sm = SubscriptionManager.from(activity) ?: return@let
+                    val infos = try {
+                        sm.activeSubscriptionInfoList
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    infos?.firstOrNull { it.simSlotIndex == slot }?.subscriptionId?.let { return it }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return try {
+            SubscriptionManager.getDefaultDataSubscriptionId()
+        } catch (_: Throwable) {
+            Int.MIN_VALUE
+        }
+    }
+
     // ---------- extension ----------
+
+    /** Extras filed under their stock parent: 33->[27,29], 9->[11], 0->[2], 1->[]. */
+    private val EXTRA_AFTER = mapOf(
+        33 to listOf(27, 29),
+        9 to listOf(11),
+        0 to listOf(2),
+    )
+
+    /**
+     * Rebuild canonical per-generation order from whatever stock currently holds.
+     * Idempotent: already-extended arrays normalize to the same order.
+     */
+    private fun buildOrdered(stockLabels: List<String>, stockValues: List<Int>): Pair<Array<String>, Array<Int>> {
+        val labels = mutableListOf<String>()
+        val values = mutableListOf<Int>()
+        for (i in stockValues.indices) {
+            val v = stockValues[i]
+            if (EXTRA_INTS.contains(v)) continue // dropped here, re-added via mapping below
+            labels.add(stockLabels.getOrElse(i) { v.toString() })
+            values.add(v)
+            for (e in EXTRA_AFTER[v].orEmpty()) {
+                labels.add(NetModes.labelFor(e) ?: e.toString())
+                values.add(e)
+            }
+        }
+        for (m in NetModes.EXTRA_MODES) {
+            if (!values.contains(m.networkMode)) {
+                labels.add(m.label)
+                values.add(m.networkMode)
+            }
+        }
+        return labels.toTypedArray() to values.toTypedArray()
+    }
 
     private fun extendActivity(act: Any) {
         val labels = try {
@@ -123,12 +235,12 @@ object OplusPreferredNetworkHook {
             null
         }
         if (labels == null || values == null) return // data not loaded yet
-        if (values.contains(27) && values.contains(29)) {
-            wrapClickListener(act) // already extended; make sure clicks are wrapped
+        val (newLabels, newValues) = buildOrdered(labels.toList(), values.toList())
+        if (labels.toList() == newLabels.toList() && values.toList() == newValues.toList()) {
+            wrapClickListener(act) // already canonical; make sure clicks are wrapped
+            refreshCheck(act, newValues)
             return
         }
-        val newLabels = (labels.toList() + NetModes.EXTRA_MODES.map { it.label }).toTypedArray()
-        val newValues = (values.toList() + NetModes.EXTRA_MODES.map { it.networkMode }).toTypedArray()
         setArrayFieldsDeep(act, newLabels, newValues)
         var adapterClass = "?"
         try {
@@ -155,6 +267,33 @@ object OplusPreferredNetworkHook {
         }
         XposedBridge.log("$TAG: OPlus list extended (adapter=$adapterClass): ${newLabels.toList()} / ${newValues.toList()}")
         wrapClickListener(act)
+        refreshCheck(act, newValues)
+    }
+
+    /** Point the list's checked row at the live modem mode (best-effort). */
+    private fun refreshCheck(act: Any, values: Array<Int>) {
+        try {
+            val activity = act as? Activity ?: return
+            val subId = try {
+                activity.intent?.getIntExtra("subscription", Int.MIN_VALUE) ?: Int.MIN_VALUE
+            } catch (_: Throwable) {
+                Int.MIN_VALUE
+            }
+            val mode = NetModes.currentMode(activity, subId) ?: return
+            val idx = values.indexOf(mode)
+            if (idx < 0) return
+            val lv = try {
+                XposedHelpers.getObjectField(act, "g")
+            } catch (_: Throwable) {
+                null
+            } ?: return
+            try {
+                XposedHelpers.callMethod(lv, "setItemChecked", idx, true)
+                XposedHelpers.callMethod(lv, "setSelection", idx)
+            } catch (_: Throwable) {
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     /** Set every String[] / Integer[] / int[] field on obj (whole hierarchy) to our arrays. */
@@ -283,15 +422,17 @@ object OplusPreferredNetworkHook {
             val wrapper = object : AdapterView.OnItemClickListener {
                 override fun onItemClick(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                     try {
-                        val count = try {
-                            parent?.count ?: 0
+                        // Race-proof: resolve the tapped VALUE from the live arrays,
+                        // never from position arithmetic (stock rebuilds to 4 rows
+                        // between our extensions; positions alone lie in that window).
+                        val vals = try {
+                            @Suppress("UNCHECKED_CAST")
+                            XposedHelpers.getObjectField(act, "j") as? Array<Int>
                         } catch (_: Throwable) {
-                            0
+                            null
                         }
-                        val stockCount = count - NetModes.EXTRA_MODES.size
-                        val extraIdx = position - stockCount
-                        if (count > 0 && extraIdx in NetModes.EXTRA_MODES.indices) {
-                            val mode = NetModes.EXTRA_MODES[extraIdx].networkMode
+                        val mode = vals?.getOrNull(position)
+                        if (mode != null && EXTRA_INTS.contains(mode)) {
                             val subId = subIdOf(activity)
                             XposedBridge.log("$TAG: OPlus row tap pos=$position -> mode=$mode sub=$subId")
                             if (NetModes.applyMode(activity, subId, mode)) {

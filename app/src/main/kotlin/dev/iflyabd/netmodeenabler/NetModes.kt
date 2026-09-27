@@ -96,6 +96,34 @@ object NetModes {
     }
 
     /**
+     * Read back the modem's USER-reason allowed mask for [subId] and map it to
+     * one of our 4 modes. Returns null for any stock/unknown state (leave UI alone).
+     */
+    fun currentMode(context: Context, subId: Int): Int? {
+        try {
+            val tm = context.getSystemService(TelephonyManager::class.java) ?: return null
+            val subTm = try {
+                if (subId != Int.MIN_VALUE) tm.createForSubscriptionId(subId) else tm
+            } catch (_: Throwable) {
+                tm
+            }
+            val m = subTm.javaClass.methods.firstOrNull {
+                it.name == "getAllowedNetworkTypesForReason" && it.parameterTypes.size == 1
+            } ?: return null
+            val mask = try {
+                m.invoke(subTm, reasonUser(subTm.javaClass)) as? Long
+            } catch (_: Throwable) {
+                null
+            } ?: return null
+            for (mode in listOf(NR_ONLY, NR_LTE, LTE_ONLY, WCDMA_ONLY)) {
+                if (mask == maskFor(mode, subTm.javaClass)) return mode
+            }
+        } catch (_: Throwable) {
+        }
+        return null
+    }
+
+    /**
      * Apply [networkMode] to [subId]'s modem. Tries the modern allowed-network-types
      * API first, falls back to the legacy setPreferredNetworkType int path.
      */
